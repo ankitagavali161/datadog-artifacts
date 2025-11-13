@@ -1,0 +1,244 @@
+# --- 1. PROVIDER & VARIABLES (Declarations) ---
+# Define required variables for secure, reusable configuration.
+variable "datadog_api_key" {
+  type        = string
+  description = "Datadog API Key"
+  sensitive   = true
+}
+
+variable "datadog_app_key" {
+  type        = string
+  description = "Datadog Application Key"
+  sensitive   = true
+}
+
+variable "cluster_name" {
+  type        = string
+  description = "The name tag/scope for the Kubernetes cluster (e.g., k8s-cluster:production-a)"
+}
+
+variable "service_name" {
+  type        = string
+  description = "The primary application service name for APM/Latency checks (e.g., service:web-app)"
+  default     = "service:web-app"
+}
+
+variable "alert_recipients" {
+  type        = string
+  description = "Comma-separated list of notification recipients (e.g., '@slack-ops', 'user@domain.com')"
+  default     = "@slack-kubernetes-alerts"
+}
+
+# Provider setup
+terraform {
+  required_providers {
+    datadog = {
+      source  = "DataDog/datadog"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "datadog" {
+  api_key = var.datadog_api_key
+  app_key = var.datadog_app_key
+}
+
+# --- 2. LOCAL VARIABLES (Monitor Definitions) ---
+# Define all monitor configurations in a single, reusable map for 'for_each'.
+locals {
+  default_message = "Monitor triggered for {{name}} in {{${var.cluster_name}}}! Review linked data: {{link for dashboard}}. Notify: ${var.alert_recipients}"
+
+  # Best practice: Group all 20 monitors into a map for easy management.
+  # This uses the DRY (Don't Repeat Yourself) principle.
+  monitors = {
+    # --- APM & SERVICE HEALTH MONITORS (5) ---
+    high_p95_latency = {
+      name    = "APM - Critical P95 Latency for ${var.service_name} / {{resource}}"
+      type    = "metric alert"
+      query   = "avg(last_5m):trace.http.request.duration.p95{${var.service_name}, ${var.cluster_name}} by {resource} > 0.8"
+      message = "Service Latency is severely impacting user experience. Critical when > 800ms."
+      critical = 0.8
+      warning  = 0.5
+    },
+    high_error_rate = {
+      name    = "APM - High Error Rate (>5%%) for ${var.service_name}"
+      type    = "metric alert"
+      query   = "avg(last_5m):trace.error.count{${var.service_name}, ${var.cluster_name}}.as_rate() / avg(last_5m):trace.http.request.hits{${var.service_name}, ${var.cluster_name}}.as_rate() > 0.05"
+      message = "Error rate above 5%%. Check application logs/traces immediately."
+      critical = 0.05
+      warning  = 0.02
+    },
+    low_request_volume = {
+      name    = "APM - Service Traffic Flatline (Potential Outage) ${var.service_name}"
+      type    = "metric alert"
+      query   = "sum(last_10m):trace.http.request.hits{${var.service_name}, ${var.cluster_name}} < 10"
+      message = "No requests received in 10 minutes. Service may be down or load balancer configured incorrectly."
+      critical = 10
+      notify_no_data = true
+      no_data_timeframe = 15
+    },
+    spike_in_fatal_logs = {
+      name    = "Logs - High Count of FATAL Logs in ${var.service_name}"
+      type    = "log alert"
+      query   = "logs(\"${var.service_name} status:fatal\").index(\"*\").rollup(\"count\").last(\"5m\") > 1"
+      message = "A fatal log was detected. Investigate immediately as this often means process termination."
+      critical = 1
+    },
+    high_db_latency = {
+      name    = "APM - Database Query Latency Spiking (>300ms)"
+      type    = "metric alert"
+      query   = "avg(last_5m):trace.db.query.duration.avg{type:sql, ${var.cluster_name}} by {service} > 0.3"
+      message = "Database is slow. Check RDS/DB metrics for CPU saturation or connection pooling issues."
+      critical = 0.3
+      warning  = 0.15
+    },
+
+    # --- KUBERNETES CONTROL PLANE & NODE HEALTH MONITORS (10) ---
+    node_not_ready = {
+      name    = "K8s - Node Not Ready (Availability Check) ${var.cluster_name}"
+      type    = "service check"
+      query   = "\"kubernetes.node.ready\".by(\"node\").last(1).count_by_status([\"critical\"]) > 0"
+      message = "Node {{node.name}} is reporting as NotReady. Check Kubelet logs."
+      critical = 0
+    },
+    node_cpu_saturation = {
+      name    = "K8s - Node CPU Saturation (>85%%)"
+      type    = "metric alert"
+      query   = "avg(last_15m):avg:kubernetes.cpu.usage.total{${var.cluster_name}} by {host} > 0.85"
+      message = "Node CPU is nearly exhausted. Consider Horizontal Pod Autoscaler tuning or scaling the node pool."
+      critical = 0.85
+      warning  = 0.75
+    },
+    node_memory_saturation = {
+      name    = "K8s - Node Memory Saturation (>80%%)"
+      type    = "metric alert"
+      query   = "avg(last_15m):avg:kubernetes.memory.usage.total{${var.cluster_name}} by {host} > 0.80"
+      message = "Node Memory is nearly exhausted. Potential OOM risks."
+      critical = 0.80
+      warning  = 0.70
+    },
+    deployment_unavailable = {
+      name    = "K8s - Deployment Has Unavailable Pods / {{kube_deployment}}"
+      type    = "metric alert"
+      query   = "sum(last_5m):kube_deployment_status_replicas_unavailable{${var.cluster_name}} by {kube_deployment} > 0"
+      message = "A Deployment has failed to meet its replica count. Check reasons for Pod failure/eviction."
+      critical = 0
+    },
+    too_many_pending_pods = {
+      name    = "K8s - High Count of Pending Pods"
+      type    = "metric alert"
+      query   = "sum(last_15m):kube_pod_status_phase{phase:pending, ${var.cluster_name}} > 5"
+      message = "Too many pods are stuck in Pending state. Check node availability and resource requests/limits."
+      critical = 5
+      warning  = 2
+    },
+    kubelet_down = {
+      name    = "K8s - Kubelet Agent Down (Health Check)"
+      type    = "service check"
+      query   = "\"kubernetes.kubelet.check\".by(\"host\").last(1).count_by_status([\"critical\"]) > 0"
+      message = "The Kubelet service on host {{host.name}} is failing its health check. Node is likely unhealthy."
+      critical = 0
+    },
+    high_pod_restart_rate = {
+      name    = "K8s - High Pod Restart Rate / {{kube_deployment}}"
+      type    = "metric alert"
+      query   = "sum(last_15m):sum:kubernetes.containers.restarts{${var.cluster_name}} by {kube_deployment} > 5"
+      message = "A deployment is experiencing container crash-looping or high restart frequency (more than 5 in 15m)."
+      critical = 5
+      warning  = 2
+    },
+    oom_killed_containers = {
+      name    = "K8s - Container OOM Kill Detected / {{kube_deployment}}"
+      type    = "metric alert"
+      query   = "sum(last_5m):sum:kubernetes.container.oom_killed{${var.cluster_name}} > 0"
+      message = "A container was OOMKilled. This is a critical sign of insufficient memory limits."
+      critical = 1
+    },
+    disk_pressure = {
+      name    = "K8s - Node Disk Usage Critical (>90%%)"
+      type    = "metric alert"
+      query   = "avg(last_15m):avg:system.disk.in_use{${var.cluster_name}, device:/dev/disk} by {host, device} > 0.90"
+      message = "Node disk is almost full. This can lead to pod eviction and node instability."
+      critical = 0.90
+      warning  = 0.80
+    },
+    high_api_server_latency = {
+      name    = "K8s - API Server Latency P99 Spiking (>1s)"
+      type    = "metric alert"
+      query   = "avg(last_5m):avg:kubernetes.apiserver.request_latencies.bucket{resource:pods, verb:GET, quantile:0.99} > 1000"
+      message = "API Server is slow. This affects scheduling, kubectl commands, and control plane stability."
+      critical = 1000
+      warning  = 500
+    },
+
+    # --- AWS INFRASTRUCTURE & RESOURCE MONITORS (5) ---
+    aws_elb_5xx_errors = {
+      name    = "AWS ELB - High HTTP 5xx Errors / {{name}}"
+      type    = "metric alert"
+      query   = "sum(last_5m):sum:aws.elb.httpcode_elb_5xx{${var.cluster_name}} by {name} > 10"
+      message = "Load balancer returning too many 5xx errors. The underlying application is failing."
+      critical = 10
+      warning  = 5
+    },
+    aws_rds_cpu_saturation = {
+      name    = "AWS RDS - CPU Utilization Saturation (>85%%)"
+      type    = "metric alert"
+      query   = "avg(last_15m):avg:aws.rds.cpuutilization{${var.cluster_name}} by {dbinstanceidentifier} > 85"
+      message = "RDS CPU is saturated. This will cause slow DB queries and cascade into application latency."
+      critical = 85
+      warning  = 75
+    },
+    aws_rds_connections_limit = {
+      name    = "AWS RDS - Connections Approaching Limit"
+      type    = "metric alert"
+      query   = "avg(last_5m):avg:aws.rds.databaseconnections{${var.cluster_name}} / avg:aws.rds.maximumusedtransactionids{*} * 100 > 80" # Simplified connections check
+      message = "RDS connections are over 80%% of the allowed limit. Increase connection limit or optimize connection usage."
+      critical = 80
+      warning  = 70
+    },
+    aws_asg_no_healthy_instances = {
+      name    = "AWS ASG - Auto Scaling Group Has No Healthy Instances"
+      type    = "metric alert"
+      query   = "avg(last_5m):avg:aws.autoscaling.group_in_service_instances{${var.cluster_name}} < 1"
+      message = "Auto Scaling Group for node pool has zero healthy instances. Check health checks and instance launch configurations."
+      critical = 1
+    },
+    system_io_wait_time = {
+      name    = "System - High IO Wait Time (>10%%)"
+      type    = "metric alert"
+      query   = "avg(last_15m):avg:system.iowait{${var.cluster_name}} > 0.1"
+      message = "System I/O wait time is high. Potential disk or EBS bottleneck on the underlying nodes."
+      critical = 0.1
+      warning  = 0.05
+    }
+  }
+}
+
+# --- 3. RESOURCE GENERATION (The 'for_each' loop) ---
+# Create one datadog_monitor resource for every entry in the local.monitors map.
+resource "datadog_monitor" "best_practice_k8s_monitors" {
+  for_each = local.monitors
+
+  name               = "[K8S PROD] ${each.value.name}"
+  type               = lookup(each.value, "type", "metric alert")
+  query              = each.value.query
+  message            = format("%s \n\n %s", each.value.message, local.default_message)
+  tags               = ["k8s:core", "env:prod", "team:platform", var.cluster_name]
+  
+  # Configuration options for all monitors
+  priority           = 2 # High priority for production alerts
+  notify_no_data     = lookup(each.value, "notify_no_data", false)
+  no_data_timeframe  = lookup(each.value, "no_data_timeframe", 20)
+  include_tags       = true
+
+  # Threshold block is only included if critical threshold is defined
+  dynamic "monitor_thresholds" {
+    for_each = try(each.value.critical != null ? [1] : [], []) # Check if critical is defined
+    content {
+      critical = each.value.critical
+      warning  = lookup(each.value, "warning", null)
+      ok       = lookup(each.value, "ok_threshold", null)
+    }
+  }
+}
